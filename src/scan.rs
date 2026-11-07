@@ -127,6 +127,8 @@ pub struct Data {
     pub denied: Vec<PathBuf>,
     /// App bundle -> last opened (from Spotlight).
     pub last_used: HashMap<PathBuf, i64>,
+    /// Tool-provided details per category (Docker, simulators), keyed by rule title.
+    pub providers: HashMap<&'static str, crate::providers::PState>,
 }
 
 pub const PHASE_HOTSPOTS: u8 = 1;

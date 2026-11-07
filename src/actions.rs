@@ -20,6 +20,12 @@ pub struct Task {
     pub path: PathBuf,
     pub size: u64,
     pub mode: Mode,
+    /// Remove by running this command (Docker, simctl) instead of touching files.
+    pub cmd: Option<Vec<String>>,
+    pub provider: Option<&'static str>,
+    pub order: u8,
+    /// What to show while it runs (label or path).
+    pub label: String,
 }
 
 /// The removal queue and its progress, shared with the UI. Removals run one at a
@@ -28,8 +34,10 @@ pub struct Task {
 pub struct Job {
     queue: Mutex<VecDeque<Task>>,
     pub running: AtomicBool,
-    /// Path and mode of the item being removed right now.
-    pub current: Mutex<Option<(PathBuf, Mode)>>,
+    /// Path, mode and display label of the item being removed right now.
+    pub current: Mutex<Option<(PathBuf, Mode, String)>>,
+    /// Providers whose items were removed in this batch (to re-query afterwards).
+    pub touched: Mutex<HashSet<&'static str>>,
     /// Current batch (resets when a new batch starts on an idle queue).
     pub done_items: AtomicUsize,
     pub total_items: AtomicUsize,
@@ -52,7 +60,7 @@ impl Job {
     }
 
     pub fn current_path(&self) -> Option<PathBuf> {
-        self.current.lock().unwrap().as_ref().map(|(p, _)| p.clone())
+        self.current.lock().unwrap().as_ref().map(|(p, _, _)| p.clone())
     }
 
     /// Overall progress of the batch, counting partly deleted folders.
@@ -73,7 +81,11 @@ pub fn enqueue(job: &Arc<Job>, sh: &Arc<Shared>, tasks: Vec<Task>, home: PathBuf
             c.store(0, Relaxed);
         }
         job.errors.lock().unwrap().clear();
+        job.touched.lock().unwrap().clear();
     }
+    // Within what's added now: containers before the images they use, etc.
+    let mut tasks = tasks;
+    tasks.sort_by_key(|t| t.order);
     job.total_items.fetch_add(tasks.len(), Relaxed);
     job.total_bytes.fetch_add(tasks.iter().map(|t| t.size).sum(), Relaxed);
     q.extend(tasks);
@@ -100,28 +112,38 @@ fn worker(job: &Job, sh: &Shared, home: &Path) {
                 }
             }
         };
-        *job.current.lock().unwrap() = Some((task.path.clone(), task.mode));
+        *job.current.lock().unwrap() = Some((task.path.clone(), task.mode, task.label.clone()));
         job.item_bytes.store(0, Relaxed);
-        let res = match task.mode {
-            Mode::Trash => trash(&task.path, home),
-            Mode::Delete => delete_tree(&task.path, &job.item_bytes),
+        let res = match (&task.cmd, task.mode) {
+            (Some(cmd), _) => crate::providers::run(cmd, std::time::Duration::from_secs(900))
+                .map(|_| ())
+                .map_err(io::Error::other),
+            (None, Mode::Trash) => trash(&task.path, home),
+            (None, Mode::Delete) => delete_tree(&task.path, &job.item_bytes),
         };
+        if let Some(p) = task.provider {
+            job.touched.lock().unwrap().insert(p);
+        }
         match res {
             Ok(()) => {
+                if let Some(p) = task.provider {
+                    crate::providers::forget(sh, p, &task.path);
+                }
                 sh.apply_removal(&task.path, task.size);
-                let (batch, session) = match task.mode {
-                    Mode::Trash => (&job.batch_trashed, &job.trashed),
-                    Mode::Delete => (&job.batch_freed, &job.freed),
+                let (batch, session) = match (task.cmd.is_some(), task.mode) {
+                    (true, _) => (&job.batch_freed, &job.freed),
+                    (false, Mode::Trash) => (&job.batch_trashed, &job.trashed),
+                    (false, Mode::Delete) => (&job.batch_freed, &job.freed),
                 };
                 batch.fetch_add(task.size, Relaxed);
                 session.fetch_add(task.size, Relaxed);
             }
             Err(e) => {
                 // A partial delete still freed something: re-measure what's left.
-                if task.mode == Mode::Delete && task.path.exists() {
+                if task.cmd.is_none() && task.mode == Mode::Delete && task.path.exists() {
                     sh.refresh(&task.path);
                 }
-                job.errors.lock().unwrap().push(format!("{}: {e}", task.path.display()));
+                job.errors.lock().unwrap().push(format!("{}: {e}", task.label));
             }
         }
         job.item_bytes.store(0, Relaxed);

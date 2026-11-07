@@ -4,6 +4,8 @@ Find out where your disk space went and win it back, biggest wins first.
 
 ![](./scr1.png)
 
+![](./scr2.png)
+
 ## Getting started
 
 ```bash
@@ -46,12 +48,35 @@ usage and counts hard links once.
   `REVIEW` (your data or installs). **Items** (right) show size and age: last
   modified, or for apps *last launched* (the access time of the app's executable).
 - `o` selects everything unused for 3 months; press again for 6 months, 1 year, 2 years.
-  `s` sorts by age, `space` toggles one item, `a`/`n` select all/none.
-- `d` removes the selection: **t** moves it to the Trash, **D** deletes permanently.
-  It runs in the background and the numbers update as items go.
-- `x` runs a category's proper cleanup command (`docker system prune -a --volumes`,
-  `npm cache clean --force`, `brew autoremove && brew cleanup`, `xcrun simctl delete
-  unavailable`, …), then re-measures.
+  `s` cycles the sort: size → most recently used first → least recently used first.
+  `b` selects the item under the cursor and everything below it (and unselects
+  everything above). So: sort most-recent-first, put the cursor on the first item
+  that's too old, press `b`. `space` toggles one item, `a`/`n` select all/none.
+- `d` removes the selection: **t** moves it to the Trash, **D** deletes permanently
+  (in parallel). A panel shows a spinner, a byte-level progress bar and the current
+  item. Rows show a spinner while being removed and `…` while queued. Pressing `d`
+  again while busy adds to the queue.
+- `x` runs a category's proper cleanup command (`npm cache clean --force`, `brew
+  autoremove && brew cleanup`, …), then re-measures. Some categories offer a menu of
+  options from gentle to thorough (e.g. Docker: build cache unused 30+ days … all
+  unused volumes).
+
+### Tool-aware categories
+
+Some space is one opaque blob on disk, but a tool knows what's inside it. For those,
+diskhog asks the tool and lists the real items, with last-used dates, so `o`, `space`
+and `d` work just like they do for folders:
+
+| Category | Items | Removed with |
+|---|---|---|
+| Docker Desktop disk image | images, containers, volumes, build-cache entries ≥ 10 MB | `docker rm` / `rmi` / `volume rm` / `builder prune --filter id=…` |
+| iOS Simulator devices | each simulator (last booted) | `xcrun simctl delete <udid>` |
+| Simulator runtimes | each runtime (last used) | `xcrun simctl runtime delete <id>` |
+
+Running containers and simulators can't be selected. In a batch, containers are
+removed before the images they use, and the confirm dialog warns when Docker volumes
+(often database data) are included. Docker Desktop gives freed space back to macOS
+gradually, so the disk image can take a while to shrink.
 - `tab` switches to the **Explorer**, an ncdu-style folder browser that tags
   folders belonging to a cleanup category. `r` reveals the item in Finder. `?` shows help.
 

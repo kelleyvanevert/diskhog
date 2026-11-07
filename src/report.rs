@@ -114,8 +114,9 @@ pub fn print(args: &Args, ctx: &Context, scan: &Data, sugg: &[Suggestion], info:
         println!("  {:>2}. {}  {}  {}", i + 1, st.size(s.size, 8), tag, st.bold(&s.title));
         let indent = " ".repeat(24);
         println!("{indent}{} {}", st.cyan("→"), st.cyan(&s.how));
-        if let Some(cmd) = &s.cmd {
-            println!("{indent}  {}", st.cyan(&st.bold(&format!("$ {cmd}"))));
+        for (desc, cmd) in &s.cmds {
+            let desc = if s.cmds.len() > 1 { format!("{desc}: ") } else { String::new() };
+            println!("{indent}  {}{}", st.dim(&desc), st.cyan(&st.bold(&format!("$ {cmd}"))));
         }
         if let Some(note) = &s.note {
             println!("{indent}{}", st.yellow(note));
@@ -126,7 +127,7 @@ pub fn print(args: &Args, ctx: &Context, scan: &Data, sugg: &[Suggestion], info:
             println!(
                 "{indent}{}  {}{}",
                 st.size(item.size, 8),
-                truncate_middle(&display_path(&item.path, home), 90),
+                item.label.clone().unwrap_or_else(|| truncate_middle(&display_path(&item.path, home), 90)),
                 st.dim(&when)
             );
         }

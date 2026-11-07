@@ -25,6 +25,8 @@ pub struct Rule {
     pub paths: &'static [&'static str],
     /// A command that cleans this category properly (offered with `x`).
     pub cmd: Option<&'static str>,
+    /// Alternative cleanup commands as (description, command), offered with `x`.
+    pub options: &'static [(&'static str, &'static str)],
     /// List the children of each matched folder as separate items.
     pub expand: bool,
     /// Items may be deleted from diskhog. False where deleting files directly would
@@ -35,6 +37,10 @@ pub struct Rule {
 impl Rule {
     const fn cmd(mut self, c: &'static str) -> Self {
         self.cmd = Some(c);
+        self
+    }
+    const fn options(mut self, o: &'static [(&'static str, &'static str)]) -> Self {
+        self.options = o;
         self
     }
     const fn expand(mut self) -> Self {
@@ -48,7 +54,7 @@ impl Rule {
 }
 
 const fn r(title: &'static str, safety: Safety, how: &'static str, paths: &'static [&'static str]) -> Rule {
-    Rule { title, safety, how, paths, cmd: None, expand: false, deletable: true }
+    Rule { title, safety, how, paths, cmd: None, options: &[], expand: false, deletable: true }
 }
 
 use Safety::*;
@@ -71,8 +77,15 @@ pub const RULES: &[Rule] = &[
 
     // ── Containers & VMs ──────────────────────────────────────────────────
     r("Docker Desktop disk image", Review,
-      "Removes unused images, stopped containers and volumes. `docker system df` shows what's inside",
-      &["~/Library/Containers/com.docker.docker/Data/vms"]).cmd("docker system prune -a --volumes").manual(),
+      "Pick images, containers, volumes and build cache below (o: unused for 3+ months), or press x for prune options",
+      &["~/Library/Containers/com.docker.docker/Data/vms"]).options(&[
+        ("Build cache not used for 30+ days", "docker builder prune -f --filter until=720h"),
+        ("All build cache", "docker builder prune -af"),
+        ("Stopped containers, and unused images created 30+ days ago",
+         "docker container prune -f --filter until=720h && docker image prune -af --filter until=720h"),
+        ("Everything unused except volumes (images, containers, networks, cache)", "docker system prune -af"),
+        ("Volumes not used by any container (deletes their data, e.g. databases!)", "docker volume prune -af"),
+      ]).manual(),
     r("OrbStack / Colima / Podman", Review, "Prune unused images and containers",
       &["~/.orbstack", "~/Library/Group Containers/*.dev.orbstack", "~/.colima", "~/.local/share/containers"])
         .cmd("docker system prune -a").manual(),
@@ -87,14 +100,17 @@ pub const RULES: &[Rule] = &[
       &["~/Library/Developer/Xcode/* DeviceSupport"]).expand(),
     r("Xcode archives", Review, "Keep archives of builds you still need to symbolicate",
       &["~/Library/Developer/Xcode/Archives"]).expand(),
-    r("iOS Simulator devices", Review, "Deletes simulators whose runtime is no longer installed; remove others in Xcode › Devices",
+    r("iOS Simulator devices", Review, "Pick simulators below (sorted by last booted with s), or x to remove ones whose runtime is gone",
       &["~/Library/Developer/CoreSimulator/Devices"]).cmd("xcrun simctl delete unavailable").manual(),
     r("Simulator & SwiftUI preview caches", Safe, "Rebuilt automatically",
       &["~/Library/Developer/CoreSimulator/Caches", "~/Library/Developer/Xcode/UserData/Previews", "/Library/Developer/CoreSimulator/Caches"]),
     r("Simulator runtimes (iOS/watchOS/visionOS)", Review,
-      "`xcrun simctl runtime list`, then `xcrun simctl runtime delete <id>` (or Xcode › Settings › Components)",
+      "Pick runtimes you no longer test on (removed with simctl), or x for the not-used-since options",
       &["/Library/Developer/CoreSimulator/Images", "/Library/Developer/CoreSimulator/Cryptex"])
-        .cmd("xcrun simctl runtime list").manual(),
+        .options(&[
+          ("Runtimes not used for 90+ days", "xcrun simctl runtime delete --notUsedSinceDays 90"),
+          ("Runtimes not used for 180+ days", "xcrun simctl runtime delete --notUsedSinceDays 180"),
+        ]).manual(),
     r("CocoaPods caches", Safe, "Re-downloaded on next pod install", &["~/Library/Caches/CocoaPods", "~/.cocoapods/repos"])
         .cmd("pod cache clean --all"),
 
@@ -202,8 +218,14 @@ pub struct Item {
     /// `mtime` is when it was last opened (apps), not last modified.
     pub opened: bool,
     pub selectable: bool,
-    /// Shown instead of the path's own name, e.g. for "everything else" rows.
-    pub note: Option<&'static str>,
+    /// Extra info shown after the name, e.g. "running" or "everything else in here".
+    pub note: Option<String>,
+    /// Shown instead of the path (for tool-provided items like Docker images).
+    pub label: Option<String>,
+    /// Removed by running this command instead of deleting files.
+    pub cmd: Option<Vec<String>>,
+    /// Order within a removal batch (lower first).
+    pub order: u8,
 }
 
 #[derive(Clone)]
@@ -212,7 +234,12 @@ pub struct Category {
     pub title: String,
     pub safety: Safety,
     pub how: String,
-    pub cmd: Option<String>,
+    /// Cleanup commands as (description, command).
+    pub cmds: Vec<(String, String)>,
+    /// Tool that provides this category's items, if any.
+    pub provider: Option<&'static str>,
+    /// Header of the age column: "Modified", "Launched", "Last used".
+    pub age_label: &'static str,
     pub size: u64,
     pub items: Vec<Item>,
     pub note: Option<String>,
@@ -418,7 +445,10 @@ pub fn analyze(d: &Data, ctx: &Context) -> Vec<Category> {
                     mtime: if remainder { None } else { mtime },
                     opened,
                     selectable: rule.deletable && !remainder,
-                    note: remainder.then_some("everything else in here (small items)"),
+                    note: remainder.then(|| "everything else in here (small items)".into()),
+                    label: None,
+                    cmd: None,
+                    order: 0,
                 });
             }
             Owner::Artifact(j) => {
@@ -430,6 +460,9 @@ pub fn analyze(d: &Data, ctx: &Context) -> Vec<Category> {
                     opened: false,
                     selectable: true,
                     note: None,
+                    label: None,
+                    cmd: None,
+                    order: 0,
                 });
             }
         }
@@ -443,7 +476,7 @@ pub fn analyze(d: &Data, ctx: &Context) -> Vec<Category> {
             rule.title.to_string(),
             rule.safety,
             rule.how.to_string(),
-            rule.cmd.map(str::to_string),
+            rule_cmds(rule),
             items,
             None,
             refresh.remove(&i).unwrap_or_default(),
@@ -456,7 +489,7 @@ pub fn analyze(d: &Data, ctx: &Context) -> Vec<Category> {
         let stale: u64 = items.iter().filter(|i| i.mtime.is_some_and(|m| m < stale_cutoff)).map(|i| i.size).sum();
         let note = (stale > 0).then(|| format!("{} untouched for {}+ days", crate::human(stale), ctx.stale_days));
         let title = format!("{} ({} {})", kind.label(), n, if n == 1 { "folder" } else { "folders" });
-        out.push(category(format!("art:{kind:?}"), title, Safe, kind.how().to_string(), None, items, note, vec![]));
+        out.push(category(format!("art:{kind:?}"), title, Safe, kind.how().to_string(), vec![], items, note, vec![]));
     }
 
     // Files inside app bundles or system-managed folders aren't yours to delete.
@@ -469,7 +502,17 @@ pub fn analyze(d: &Data, ctx: &Context) -> Vec<Category> {
     let files = |list: &[crate::scan::FileHit]| -> Vec<Item> {
         list.iter()
             .filter(|f| !claimed_ancestor(&f.path) && !system_owned(&f.path))
-            .map(|f| Item { path: f.path.clone(), size: f.size, mtime: Some(f.mtime), opened: false, selectable: true, note: None })
+            .map(|f| Item {
+                path: f.path.clone(),
+                size: f.size,
+                mtime: Some(f.mtime),
+                opened: false,
+                selectable: true,
+                note: None,
+                label: None,
+                cmd: None,
+                order: 0,
+            })
             .collect()
     };
     let installers = files(&d.installers);
@@ -479,7 +522,7 @@ pub fn analyze(d: &Data, ctx: &Context) -> Vec<Category> {
             "Installer images (.dmg .pkg .iso .xip .ipsw)".into(),
             Safe,
             "Once the software is installed these can usually go".into(),
-            None,
+            vec![],
             installers,
             None,
             vec![],
@@ -492,13 +535,14 @@ pub fn analyze(d: &Data, ctx: &Context) -> Vec<Category> {
             format!("Other large files (≥ {})", crate::human(crate::scan::LARGE_FILE_MIN)),
             Review,
             "Your own files: delete, archive to an external drive, or move to cloud storage".into(),
-            None,
+            vec![],
             large,
             None,
             vec![],
         ));
     }
 
+    merge_providers(&mut out, d);
     out.retain(|c| c.size >= 1_000_000);
     out.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.id.cmp(&b.id)));
     out
@@ -510,14 +554,15 @@ fn category(
     title: String,
     safety: Safety,
     how: String,
-    cmd: Option<String>,
+    cmds: Vec<(String, String)>,
     mut items: Vec<Item>,
     note: Option<String>,
     refresh: Vec<PathBuf>,
 ) -> Category {
     items.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
     let size = items.iter().map(|i| i.size).sum();
-    Category { id, title, safety, how, cmd, size, items, note, refresh }
+    let age_label = if items.iter().any(|i| i.opened) { "Launched" } else { "Modified" };
+    Category { id, title, safety, how, cmds, provider: None, age_label, size, items, note, refresh }
 }
 
 #[cfg(test)]
@@ -540,5 +585,82 @@ mod tests {
         let p = Path::new("/Users/x/Library/Containers/*/Data/Library/Caches");
         assert!(glob_match(p, Path::new("/Users/x/Library/Containers/com.foo/Data/Library/Caches")));
         assert!(!glob_match(p, Path::new("/Users/x/Library/Containers/com.foo/Data/Library")));
+    }
+}
+
+fn rule_cmds(rule: &Rule) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = rule.cmd.map(|c| ("Clean up".to_string(), c.to_string())).into_iter().collect();
+    v.extend(rule.options.iter().map(|(d, c)| (d.to_string(), c.to_string())));
+    v
+}
+
+/// Replace the file-level view of provider categories (Docker, simulators) with the
+/// items the tool reports, or add a note while it's loading / unavailable.
+fn merge_providers(out: &mut Vec<Category>, d: &Data) {
+    use crate::providers::PState;
+    for &title in crate::providers::ALL {
+        let Some(i) = RULES.iter().position(|r| r.title == title) else { continue };
+        let rule = &RULES[i];
+        let id = format!("rule:{i}");
+        let state = d.providers.get(title);
+        let pos = match out.iter().position(|c| c.id == id) {
+            Some(p) => p,
+            None => {
+                // Not found on disk (e.g. runtimes live in system-managed volumes):
+                // only show it when the tool has something to say.
+                if !matches!(state, Some(PState::Ready(items)) if !items.is_empty()) {
+                    continue;
+                }
+                out.push(category(id, rule.title.into(), rule.safety, rule.how.into(), rule_cmds(rule), vec![], None, vec![]));
+                out.len() - 1
+            }
+        };
+        let c = &mut out[pos];
+        c.provider = Some(title);
+        match state {
+            Some(PState::Ready(items)) => {
+                let fs_size = c.size;
+                let mut new: Vec<Item> = items
+                    .iter()
+                    .map(|p| Item {
+                        path: p.path.clone(),
+                        size: p.size,
+                        mtime: p.mtime,
+                        opened: false,
+                        selectable: p.selectable,
+                        note: p.note.clone(),
+                        label: Some(p.label.clone()),
+                        cmd: (!p.cmd.is_empty()).then(|| p.cmd.clone()),
+                        order: p.order,
+                    })
+                    .collect();
+                new.sort_by(|a, b| b.size.cmp(&a.size));
+                let listed: u64 = new.iter().map(|i| i.size).sum();
+                if fs_size > listed + 100_000_000 {
+                    new.push(Item {
+                        path: c.items.first().map(|i| i.path.clone()).unwrap_or_default(),
+                        size: fs_size - listed,
+                        mtime: None,
+                        opened: false,
+                        selectable: false,
+                        note: Some(match title {
+                            crate::providers::DOCKER => "layers shared between images, and space Docker freed but hasn't returned to macOS yet".into(),
+                            _ => "other data in this folder".into(),
+                        }),
+                        label: Some("not attributed to an item".into()),
+                        cmd: None,
+                        order: 9,
+                    });
+                }
+                c.size = fs_size.max(listed);
+                c.items = new;
+                c.age_label = "Last used";
+            }
+            Some(PState::Loading) => {
+                c.note = Some(format!("Asking {} for details…", if title == crate::providers::DOCKER { "Docker" } else { "simctl" }))
+            }
+            Some(PState::Unavailable(msg)) => c.note = Some(msg.clone()),
+            None => {}
+        }
     }
 }

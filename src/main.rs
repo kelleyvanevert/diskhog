@@ -1,4 +1,5 @@
 mod actions;
+mod providers;
 mod report;
 mod rules;
 mod scan;
@@ -211,6 +212,9 @@ fn main() {
             sh.data.lock().unwrap().last_used = times;
             sh.bump();
         });
+    }
+    if !args.custom_roots {
+        providers::spawn_all(&sh);
     }
     let start = Instant::now();
     {

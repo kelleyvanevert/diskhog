@@ -35,14 +35,28 @@ enum Focus {
 #[derive(PartialEq, Clone, Copy)]
 enum Sort {
     Size,
-    Age,
+    /// Most recently used first: move to the first item that's too old and press b.
+    Recent,
+    /// Least recently used first.
+    Oldest,
 }
 
 enum Dialog {
-    Remove { items: Vec<(PathBuf, u64)>, total: u64 },
-    Command { cmd: String, refresh: Vec<PathBuf> },
+    Remove { items: Vec<RemoveItem>, total: u64 },
+    /// Cleanup command(s) of a category; with several, the user picks one by number.
+    Command { options: Vec<(String, String)>, refresh: Vec<PathBuf>, provider: Option<&'static str> },
     Help,
     Errors(Vec<String>),
+}
+
+#[derive(Clone)]
+struct RemoveItem {
+    path: PathBuf,
+    size: u64,
+    label: String,
+    cmd: Option<Vec<String>>,
+    provider: Option<&'static str>,
+    order: u8,
 }
 
 struct ExRow {
@@ -208,6 +222,14 @@ impl App {
                 self.dialog = Some(Dialog::Errors(errors));
             }
             self.job_summary = Some((msg, n > 0, Instant::now()));
+            let touched: Vec<&'static str> = self.job.touched.lock().unwrap().drain().collect();
+            for p in touched {
+                crate::providers::refresh(&self.sh, p);
+                if let Some(c) = self.cats.iter().find(|c| c.provider == Some(p)) {
+                    let (sh, paths) = (self.sh.clone(), c.refresh.clone());
+                    std::thread::spawn(move || paths.iter().for_each(|p| sh.refresh(p)));
+                }
+            }
         }
         self.job_was_running = running;
     }
@@ -240,10 +262,11 @@ impl App {
     fn sorted_items(&self) -> Vec<Item> {
         let Some(c) = self.cur_cat() else { return vec![] };
         let mut items = c.items.clone();
-        if self.sort == Sort::Age {
-            items.sort_by_key(|i| (!i.selectable, i.mtime.unwrap_or(i64::MIN)));
-        } else {
-            items.sort_by_key(|i| !i.selectable);
+        // Items without a date ("never used") count as oldest; unremovable rows go last.
+        match self.sort {
+            Sort::Size => items.sort_by_key(|i| !i.selectable),
+            Sort::Recent => items.sort_by_key(|i| (!i.selectable, std::cmp::Reverse(i.mtime.unwrap_or(i64::MIN)))),
+            Sort::Oldest => items.sort_by_key(|i| (!i.selectable, i.mtime.unwrap_or(i64::MIN))),
         }
         items
     }
@@ -289,6 +312,28 @@ impl App {
         items.retain(|(p, _)| !all.iter().any(|o| o != p && p.starts_with(o)));
         items.sort_by(|a, b| b.1.cmp(&a.1));
         items
+    }
+
+    /// The removal set with what's needed to remove each item (label, command).
+    fn removal_items(&self) -> Vec<RemoveItem> {
+        let known: HashMap<&Path, (&Item, Option<&'static str>)> =
+            self.cats.iter().flat_map(|c| c.items.iter().map(move |i| (i.path.as_path(), (i, c.provider)))).collect();
+        self.removal_set()
+            .into_iter()
+            .map(|(path, size)| match known.get(path.as_path()) {
+                Some((item, provider)) => RemoveItem {
+                    label: item.label.clone().unwrap_or_else(|| display_path(&path, &self.ctx.home)),
+                    cmd: item.cmd.clone(),
+                    provider: if item.cmd.is_some() { *provider } else { None },
+                    order: item.order,
+                    path,
+                    size,
+                },
+                None => RemoveItem { label: display_path(&path, &self.ctx.home), cmd: None, provider: None, order: 0, path, size },
+            })
+            // A synthetic item (docker://…) that vanished from the list can't be removed anymore.
+            .filter(|i| i.cmd.is_some() || i.path.is_absolute())
+            .collect()
     }
 
     /// Rows of the explorer for the current folder (or the scan roots at the top).
@@ -376,16 +421,16 @@ impl App {
                 self.flash("Selection cleared".into());
             }
             KeyCode::Char('d') | KeyCode::Delete | KeyCode::Char('D') => {
-                let items = self.removal_set();
+                let items = self.removal_items();
                 if items.is_empty() {
                     self.flash("Nothing selected (space selects; some categories can only be cleaned with x)".into());
                 } else {
-                    let total = items.iter().map(|(_, s)| s).sum();
+                    let total = items.iter().map(|i| i.size).sum();
                     self.dialog = Some(Dialog::Remove { items, total });
                 }
             }
             KeyCode::Char('r') => {
-                if let Some(p) = self.cursor_path() {
+                if let Some(p) = self.cursor_path().filter(|p| p.exists()) {
                     let _ = std::process::Command::new("open").arg("-R").arg(&p).spawn();
                     self.flash(format!("Revealed in Finder: {}", display_path(&p, &self.ctx.home)));
                 }
@@ -412,8 +457,13 @@ impl App {
         let page = 10;
         match (self.focus, k.code) {
             (_, KeyCode::Char('s')) => {
-                self.sort = if self.sort == Sort::Size { Sort::Age } else { Sort::Size };
+                self.sort = match self.sort {
+                    Sort::Size => Sort::Recent,
+                    Sort::Recent => Sort::Oldest,
+                    Sort::Oldest => Sort::Size,
+                };
                 self.item_state.select(Some(0));
+                *self.item_state.offset_mut() = 0;
             }
             (_, KeyCode::Char('a')) => {
                 let items: Vec<Item> = self.sorted_items().into_iter().filter(|i| i.selectable).collect();
@@ -429,9 +479,11 @@ impl App {
                 }
             }
             (_, KeyCode::Char('o')) => self.select_older(),
+            (Focus::Items, KeyCode::Char('b')) => self.select_from_cursor(),
             (_, KeyCode::Char('x')) => match self.cur_cat() {
-                Some(c) if c.cmd.is_some() => {
-                    self.dialog = Some(Dialog::Command { cmd: c.cmd.clone().unwrap(), refresh: c.refresh.clone() })
+                Some(c) if !c.cmds.is_empty() => {
+                    self.dialog =
+                        Some(Dialog::Command { options: c.cmds.clone(), refresh: c.refresh.clone(), provider: c.provider })
                 }
                 _ => self.flash("This category has no cleanup command; select items and press d".into()),
             },
@@ -490,6 +542,26 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Make the cursor row the cutoff: select it and everything below, unselect above.
+    fn select_from_cursor(&mut self) {
+        let cur = self.item_state.selected().unwrap_or(0);
+        let (mut n, mut size) = (0, 0);
+        for (idx, i) in self.sorted_items().into_iter().enumerate().filter(|(_, i)| i.selectable) {
+            if idx >= cur {
+                n += 1;
+                size += i.size;
+                self.selected.insert(i.path, i.size);
+            } else {
+                self.selected.remove(&i.path);
+            }
+        }
+        let hint = match self.sort {
+            Sort::Recent => "  (everything used less recently than the cursor row)",
+            _ => "",
+        };
+        self.flash(format!("Selected {n} items from here down · {}{hint}", human(size)));
     }
 
     fn select_older(&mut self) {
@@ -579,9 +651,11 @@ impl App {
     fn on_dialog_key(&mut self, k: KeyEvent, dialog: Dialog, t: &mut DefaultTerminal) -> io::Result<()> {
         match dialog {
             Dialog::Remove { items, total } => {
+                let has_files = items.iter().any(|i| i.cmd.is_none());
                 let mode = match k.code {
-                    KeyCode::Char('t') => Some(Mode::Trash),
+                    KeyCode::Char('t') if has_files => Some(Mode::Trash),
                     KeyCode::Char('D') => Some(Mode::Delete),
+                    KeyCode::Enter if !has_files => Some(Mode::Delete),
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => None,
                     _ => {
                         self.dialog = Some(Dialog::Remove { items, total });
@@ -589,27 +663,54 @@ impl App {
                     }
                 };
                 if let Some(mode) = mode {
-                    for (p, _) in &items {
-                        self.selected.remove(p);
+                    for i in &items {
+                        self.selected.remove(&i.path);
                     }
-                    let tasks = items.into_iter().map(|(path, size)| actions::Task { path, size, mode }).collect();
+                    let tasks = items
+                        .into_iter()
+                        .map(|i| actions::Task {
+                            path: i.path,
+                            size: i.size,
+                            mode,
+                            cmd: i.cmd,
+                            provider: i.provider,
+                            order: i.order,
+                            label: i.label,
+                        })
+                        .collect();
                     actions::enqueue(&self.job, &self.sh, tasks, self.ctx.home.clone());
                     self.job_was_running = true;
                     self.job_summary = None;
                 }
             }
-            Dialog::Command { cmd, refresh } => match k.code {
-                KeyCode::Char('y') | KeyCode::Enter => self.run_command(t, &cmd, refresh)?,
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {}
-                _ => self.dialog = Some(Dialog::Command { cmd, refresh }),
-            },
+            Dialog::Command { options, refresh, provider } => {
+                let pick = match k.code {
+                    KeyCode::Char('y') | KeyCode::Enter if options.len() == 1 => Some(0),
+                    KeyCode::Char(c @ '1'..='9') => Some(c as usize - '1' as usize).filter(|&i| i < options.len()),
+                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => return Ok(()),
+                    _ => None,
+                };
+                match pick {
+                    Some(i) => {
+                        let cmd = options[i].1.clone();
+                        self.run_command(t, &cmd, refresh, provider)?
+                    }
+                    None => self.dialog = Some(Dialog::Command { options, refresh, provider }),
+                }
+            }
             Dialog::Help | Dialog::Errors(_) => {}
         }
         Ok(())
     }
 
     /// Leave the TUI, run a cleanup command in the user's shell, come back and re-measure.
-    fn run_command(&mut self, t: &mut DefaultTerminal, cmd: &str, refresh: Vec<PathBuf>) -> io::Result<()> {
+    fn run_command(
+        &mut self,
+        t: &mut DefaultTerminal,
+        cmd: &str,
+        refresh: Vec<PathBuf>,
+        provider: Option<&'static str>,
+    ) -> io::Result<()> {
         ratatui::restore();
         println!("\n\x1b[1m$ {cmd}\x1b[0m\n");
         let status = std::process::Command::new("sh").arg("-c").arg(cmd).status();
@@ -624,6 +725,9 @@ impl App {
         *t = ratatui::init();
         t.clear()?;
         let sh = self.sh.clone();
+        if let Some(p) = provider {
+            crate::providers::refresh(&sh, p);
+        }
         std::thread::spawn(move || {
             for p in refresh {
                 sh.refresh(&p);
@@ -678,8 +782,10 @@ impl App {
             f.render_widget(Paragraph::new(text).block(block), area);
             return;
         }
-        let (path, mode) = job.current.lock().unwrap().clone().unwrap_or((PathBuf::new(), Mode::Delete));
+        let (path, mode, label) =
+            job.current.lock().unwrap().clone().unwrap_or((PathBuf::new(), Mode::Delete, String::new()));
         let (verb, color) = match mode {
+            _ if !path.is_absolute() => ("Removing with docker/simctl", Color::Red),
             Mode::Trash => ("Moving to Trash", Color::Yellow),
             Mode::Delete => ("Deleting permanently", Color::Red),
         };
@@ -711,7 +817,7 @@ impl App {
         ]);
         let line3 = Line::from(vec![
             Span::styled(" ↳ ", Style::new().dark_gray()),
-            Span::raw(truncate_middle(&display_path(&path, &self.ctx.home), inner_w.saturating_sub(4))),
+            Span::raw(truncate_middle(&label, inner_w.saturating_sub(4))),
         ]);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -859,7 +965,7 @@ impl App {
             f.render_widget(Paragraph::new(msg).block(Block::bordered().border_type(BorderType::Rounded)), right);
             return;
         };
-        let opened = items.iter().any(|i| i.opened);
+        let opened = cat.age_label != "Modified";
         let path_w = right.width.saturating_sub(3 + 9 + 11 + 6) as usize;
         let busy = (self.job.current_path(), self.job.queued());
         let rows: Vec<Row> = items
@@ -875,15 +981,20 @@ impl App {
                             Span::raw(s)
                         }
                     }
-                    None if i.opened => Span::raw("never").dark_gray(),
+                    None if i.opened || (cat.provider.is_some() && i.selectable) => Span::raw("never").dark_gray(),
                     None => Span::raw(""),
                 };
-                let path = display_path(&i.path, &self.ctx.home);
-                let label = match i.note {
-                    Some(n) => Line::from(vec![
-                        Span::raw(truncate_middle(&path, path_w.saturating_sub(n.len() + 2))),
-                        Span::styled(format!("  {n}"), Style::new().dark_gray().italic()),
-                    ]),
+                let path = i.label.clone().unwrap_or_else(|| display_path(&i.path, &self.ctx.home));
+                let label = match &i.note {
+                    Some(n) => {
+                        // Shorten the note before the name: the name is what identifies the item.
+                        let name_w = path.chars().count().min(path_w.saturating_sub(12)).max(path_w.saturating_sub(n.chars().count() + 2));
+                        let note_w = path_w.saturating_sub(name_w + 2);
+                        Line::from(vec![
+                            Span::raw(truncate_middle(&path, name_w)),
+                            Span::styled(format!("  {}", truncate_middle(n, note_w)), Style::new().dark_gray().italic()),
+                        ])
+                    }
                     None => Line::from(truncate_middle(&path, path_w)),
                 };
                 let mut row = Row::new(vec![Cell::from(check), Cell::from(size_span(i.size)), Cell::from(when), Cell::from(label)]);
@@ -897,10 +1008,12 @@ impl App {
             .collect();
         let sort_label = match self.sort {
             Sort::Size => "by size",
-            Sort::Age if opened => "by last launched",
-            Sort::Age => "oldest first",
+            Sort::Recent if opened => "most recently used first",
+            Sort::Recent => "newest first",
+            Sort::Oldest if opened => "least recently used first",
+            Sort::Oldest => "oldest first",
         };
-        let header = Row::new(vec!["", "Size", if opened { "Launched" } else { "Modified" }, "Path"])
+        let header = Row::new(vec!["", "Size", cat.age_label, if cat.provider.is_some() { "Item" } else { "Path" }])
             .style(Style::new().dark_gray().add_modifier(Modifier::UNDERLINED));
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -990,10 +1103,18 @@ impl App {
             && let Some(c) = self.cur_cat()
         {
             let mut l = vec![Span::styled(format!(" {}", c.how), Style::new().cyan())];
-            if let Some(cmd) = &c.cmd {
-                l.push(Span::raw("   "));
-                l.push(key("x"));
-                l.push(Span::styled(format!(" $ {cmd}"), Style::new().cyan().bold()));
+            match c.cmds.as_slice() {
+                [] => {}
+                [(_, cmd)] => {
+                    l.push(Span::raw("   "));
+                    l.push(key("x"));
+                    l.push(Span::styled(format!(" $ {cmd}"), Style::new().cyan().bold()));
+                }
+                many => {
+                    l.push(Span::raw("   "));
+                    l.push(key("x"));
+                    l.push(Span::styled(format!(" {} cleanup options", many.len()), Style::new().cyan().bold()));
+                }
             }
             lines.push(Line::from(l));
             match (&self.status, &c.note) {
@@ -1018,7 +1139,7 @@ impl App {
             View::Categories => vec![
                 key("↑↓"), desc("move"), key("←→"), desc("pane"), key("space"), desc("select"),
                 key("o"), desc(&format!("unused {next_age}+")), key("a"), desc("all"), key("n"), desc("none"),
-                key("s"), desc("sort"), key("d"), desc("remove"), key("x"), desc("command"),
+                key("b"), desc("this & below"), key("s"), desc("sort"), key("d"), desc("remove"), key("x"), desc("command"),
                 key("r"), desc("reveal"), key("tab"), desc("explorer"), key("?"), desc("help"), key("q"), desc("quit"),
             ],
             View::Explorer => vec![
@@ -1033,33 +1154,65 @@ impl App {
     }
 
     fn draw_dialog(&self, f: &mut Frame) {
-        let home = &self.ctx.home;
         let (title, body, width): (String, Text, u16) = match self.dialog.as_ref().unwrap() {
             Dialog::Remove { items, total } => {
                 let mut lines: Vec<Line> = vec![Line::raw("")];
-                for (p, s) in items.iter().take(10) {
+                for i in items.iter().take(10) {
                     lines.push(Line::from(vec![
                         Span::raw("  "),
-                        size_span(*s),
+                        size_span(i.size),
                         Span::raw("  "),
-                        Span::raw(truncate_middle(&display_path(p, home), 70)),
+                        Span::raw(truncate_middle(&i.label, 70)),
                     ]));
                 }
                 if items.len() > 10 {
-                    let rest: u64 = items[10..].iter().map(|(_, s)| s).sum();
+                    let rest: u64 = items[10..].iter().map(|i| i.size).sum();
                     lines.push(Line::styled(format!("  {:>9}  … and {} more", human(rest), items.len() - 10), Style::new().dark_gray()));
                 }
                 lines.push(Line::raw(""));
-                lines.push(Line::from(vec![
-                    Span::styled("  t ", Style::new().bold().yellow()),
-                    Span::raw(" Move to Trash"),
-                    Span::styled("   (space comes back once you empty the Trash)", Style::new().dark_gray()),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled("  D ", Style::new().bold().red()),
-                    Span::raw(" Delete permanently"),
-                    Span::styled("   (frees space now · cannot be undone)", Style::new().dark_gray()),
-                ]));
+                let has_files = items.iter().any(|i| i.cmd.is_none());
+                let has_cmds = items.iter().any(|i| i.cmd.is_some());
+                if has_files {
+                    lines.push(Line::from(vec![
+                        Span::styled("  t ", Style::new().bold().yellow()),
+                        Span::raw(" Move to Trash"),
+                        Span::styled("   (space comes back once you empty the Trash)", Style::new().dark_gray()),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled("  D ", Style::new().bold().red()),
+                        Span::raw(" Delete permanently"),
+                        Span::styled("   (frees space now · cannot be undone)", Style::new().dark_gray()),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled("  D/Enter ", Style::new().bold().red()),
+                        Span::raw(" Remove"),
+                        Span::styled("   (cannot be undone)", Style::new().dark_gray()),
+                    ]));
+                }
+                if has_cmds {
+                    // "docker rmi", "docker volume rm", "xcrun simctl delete", ... without the ids.
+                    let mut verbs: Vec<String> = items
+                        .iter()
+                        .filter_map(|i| i.cmd.as_ref())
+                        .map(|c| {
+                            let n = if ["volume", "builder", "container", "simctl"].contains(&c[1].as_str()) { 3 } else { 2 };
+                            c.iter().take(n).cloned().collect::<Vec<_>>().join(" ")
+                        })
+                        .collect();
+                    verbs.sort();
+                    verbs.dedup();
+                    let n = items.iter().filter(|i| i.cmd.is_some()).count();
+                    lines.push(Line::styled(format!("      {n} removed with: {}", verbs.join(" · ")), Style::new().dark_gray()));
+                    let volumes: Vec<&RemoveItem> = items.iter().filter(|i| i.path.starts_with("docker://volume")).collect();
+                    if !volumes.is_empty() {
+                        let size: u64 = volumes.iter().map(|i| i.size).sum();
+                        lines.push(Line::styled(
+                            format!("  ⚠ Includes {} Docker volume(s), {}: their data (e.g. databases) is gone for good.", volumes.len(), human(size)),
+                            Style::new().yellow().bold(),
+                        ));
+                    }
+                }
                 lines.push(Line::from(vec![Span::styled("  Esc", Style::new().bold()), Span::raw(" Cancel")]));
                 if self.job.running.load(Relaxed) {
                     lines.push(Line::raw(""));
@@ -1067,13 +1220,13 @@ impl App {
                 }
                 (format!(" Remove {} item{} · {} ", items.len(), if items.len() == 1 { "" } else { "s" }, human(*total)), Text::from(lines), 90)
             }
-            Dialog::Command { cmd, .. } => (
+            Dialog::Command { options, .. } if options.len() == 1 => (
                 " Run cleanup command ".into(),
                 Text::from(vec![
                     Line::raw(""),
                     Line::raw("  diskhog will pause and run this in your shell:"),
                     Line::raw(""),
-                    Line::styled(format!("    $ {cmd}"), Style::new().cyan().bold()),
+                    Line::styled(format!("    $ {}", options[0].1), Style::new().cyan().bold()),
                     Line::raw(""),
                     Line::raw("  Afterwards the affected folders are measured again."),
                     Line::raw(""),
@@ -1086,6 +1239,19 @@ impl App {
                 ]),
                 80,
             ),
+            Dialog::Command { options, .. } => {
+                let mut lines = vec![Line::raw(""), Line::raw("  Pick one; diskhog pauses and runs it in your shell, then re-measures:"), Line::raw("")];
+                for (i, (desc, cmd)) in options.iter().enumerate() {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {} ", i + 1), Style::new().bold().green()),
+                        Span::styled(desc.clone(), Style::new().bold()),
+                    ]));
+                    lines.push(Line::styled(format!("      $ {cmd}"), Style::new().cyan()));
+                }
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![Span::styled("  Esc", Style::new().bold()), Span::raw(" Cancel")]));
+                (" Cleanup options ".into(), Text::from(lines), 100)
+            }
             Dialog::Errors(errs) => {
                 let mut lines = vec![Line::raw("")];
                 for e in errs.iter().take(12) {
@@ -1127,7 +1293,8 @@ fn help_text() -> Text<'static> {
         row("space", "select item (on a category: select/unselect all of it)"),
         row("o", "select items unused for 3 months; press again for 6 months, 1 year, …"),
         row("a / n / C", "select all in category / none in category / clear all selections"),
-        row("s", "sort items by size or by age (apps: by last launched)"),
+        row("s", "sort: size → most recently used first → least recently used first"),
+        row("b", "select this item and everything below it (unselects the ones above)"),
         row("x", "run the category's own cleanup command (e.g. docker system prune)"),
         Line::raw(""),
         Line::styled("  Everywhere", Style::new().bold().underlined()),
