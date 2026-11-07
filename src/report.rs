@@ -1,6 +1,7 @@
-use crate::rules::{Context, Safety, Suggestion};
-use crate::scan::ScanResult;
-use crate::{Args, human};
+use crate::Args;
+use crate::rules::{Category as Suggestion, Context, Safety};
+use crate::scan::Data;
+use crate::util::{age, bar, display_path, human, thousands, truncate_middle};
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
@@ -8,6 +9,7 @@ use std::time::Duration;
 pub struct RunInfo {
     pub disk: Option<(u64, u64)>,
     pub files: u64,
+    pub errors: u64,
     pub elapsed: Duration,
     pub snapshots: Option<usize>,
 }
@@ -37,54 +39,7 @@ impl Style {
     }
 }
 
-pub fn thousands(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
-fn display_path(p: &Path, home: &Path) -> String {
-    match p.strip_prefix(home) {
-        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
-        Ok(rest) => format!("~/{}", rest.display()),
-        Err(_) => p.display().to_string(),
-    }
-}
-
-fn truncate_middle(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        return s.to_string();
-    }
-    let keep = max - 1;
-    let head: String = s.chars().take(keep / 3).collect();
-    let tail: String = s.chars().skip(n - (keep - keep / 3)).collect();
-    format!("{head}…{tail}")
-}
-
-fn age(mtime: i64, now: i64) -> String {
-    let days = (now - mtime).max(0) / 86_400;
-    match days {
-        0 => "today".into(),
-        1..=13 => format!("{days}d ago"),
-        14..=59 => format!("{}w ago", days / 7),
-        60..=729 => format!("{}mo ago", days / 30),
-        _ => format!("{}y ago", days / 365),
-    }
-}
-
-fn bar(frac: f64, width: usize) -> String {
-    let filled = ((frac.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
-}
-
-pub fn print(args: &Args, ctx: &Context, scan: &ScanResult, sugg: &[Suggestion], info: &RunInfo) {
+pub fn print(args: &Args, ctx: &Context, scan: &Data, sugg: &[Suggestion], info: &RunInfo) {
     let st = Style(args.color);
     let home = &ctx.home;
     let scanned: u64 = scan.roots.iter().map(|(_, s)| s).sum();
@@ -119,9 +74,9 @@ pub fn print(args: &Args, ctx: &Context, scan: &ScanResult, sugg: &[Suggestion],
     println!();
     println!("{}", st.heading("WHERE THE SPACE IS"));
     let mut children: HashMap<&Path, Vec<(&Path, u64)>> = HashMap::new();
-    for (p, &s) in &scan.dirs {
+    for (p, i) in &scan.dirs {
         if let Some(parent) = p.parent() {
-            children.entry(parent).or_default().push((p.as_path(), s));
+            children.entry(parent).or_default().push((p.as_path(), i.size));
         }
     }
     for v in children.values_mut() {
@@ -159,6 +114,9 @@ pub fn print(args: &Args, ctx: &Context, scan: &ScanResult, sugg: &[Suggestion],
         println!("  {:>2}. {}  {}  {}", i + 1, st.size(s.size, 8), tag, st.bold(&s.title));
         let indent = " ".repeat(24);
         println!("{indent}{} {}", st.cyan("→"), st.cyan(&s.how));
+        if let Some(cmd) = &s.cmd {
+            println!("{indent}  {}", st.cyan(&st.bold(&format!("$ {cmd}"))));
+        }
         if let Some(note) = &s.note {
             println!("{indent}{}", st.yellow(note));
         }
@@ -219,11 +177,11 @@ pub fn print(args: &Args, ctx: &Context, scan: &ScanResult, sugg: &[Suggestion],
         notes.push(format!(
             "{} folders couldn't be read (e.g. {}). For a complete picture give your terminal \
              Full Disk Access: System Settings › Privacy & Security › Full Disk Access.",
-            thousands(scan.errors),
+            thousands(info.errors),
             examples.join(", ")
         ));
     }
-    notes.push("diskhog never deletes anything. APFS clones may be counted twice, so totals can be slightly high.".into());
+    notes.push("Run diskhog in a terminal without --report for the interactive cleanup UI. APFS clones may be counted twice, so totals can be slightly high.".into());
     println!();
     println!("{}", st.heading("NOTES"));
     for n in notes {

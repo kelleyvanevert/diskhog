@@ -1,6 +1,6 @@
 //! Fast parallel disk walker.
 //!
-//! Walks every root with rayon (one task per directory), measures the space
+//! Walks with rayon (one task per directory), measures the space
 //! files actually occupy on disk (`st_blocks`, so sparse files such as
 //! Docker.raw are counted correctly), counts hard-linked files once, and on
 //! the way records:
@@ -17,7 +17,7 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 
 pub const DIR_RECORD_MIN: u64 = 10_000_000;
 pub const LARGE_FILE_MIN: u64 = 500_000_000;
@@ -97,6 +97,7 @@ pub struct Artifact {
     pub kind: ArtifactKind,
     pub path: PathBuf,
     pub size: u64,
+    /// Last activity: newest mtime inside the folder or of the project's manifest.
     pub mtime: i64,
 }
 
@@ -106,159 +107,335 @@ pub struct FileHit {
     pub mtime: i64,
 }
 
-pub struct ScanResult {
-    /// Every directory >= DIR_RECORD_MIN (plus the roots), with total on-disk size.
-    pub dirs: HashMap<PathBuf, u64>,
-    pub roots: Vec<(PathBuf, u64)>,
-    pub large_files: Vec<FileHit>,
-    pub installers: Vec<FileHit>,
-    pub artifacts: Vec<Artifact>,
-    pub errors: u64,
-    pub denied: Vec<PathBuf>,
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DirInfo {
+    pub size: u64,
+    /// Newest modification time of anything inside (recursive).
+    pub mtime: i64,
 }
 
-/// Live counters for the progress line.
+/// Everything discovered so far. The UI reads it while the scan is running.
 #[derive(Default)]
-pub struct Progress {
+pub struct Data {
+    /// Every directory >= DIR_RECORD_MIN, every hotspot target and every finished root.
+    pub dirs: HashMap<PathBuf, DirInfo>,
+    pub artifacts: Vec<Artifact>,
+    pub large: Vec<FileHit>,
+    pub installers: Vec<FileHit>,
+    /// Finished roots with their total size.
+    pub roots: Vec<(PathBuf, u64)>,
+    pub denied: Vec<PathBuf>,
+    /// App bundle -> last opened (from Spotlight).
+    pub last_used: HashMap<PathBuf, i64>,
+}
+
+pub const PHASE_HOTSPOTS: u8 = 1;
+pub const PHASE_FULL: u8 = 2;
+pub const PHASE_DONE: u8 = 3;
+
+#[derive(Default)]
+pub struct Shared {
+    pub data: Mutex<Data>,
     pub files: AtomicU64,
     pub bytes: AtomicU64,
-}
-
-struct Scanner<'a> {
-    progress: &'a Progress,
-    skip: &'a HashSet<PathBuf>,
-    dirs: Mutex<Vec<(PathBuf, u64)>>,
-    large: Mutex<Vec<FileHit>>,
-    installers: Mutex<Vec<FileHit>>,
-    artifacts: Mutex<Vec<Artifact>>,
+    pub errors: AtomicU64,
+    pub phase: AtomicU8,
+    /// Bumped whenever `data` changes, so the UI knows when to re-analyze.
+    pub version: AtomicU64,
     inodes: Mutex<HashSet<(u64, u64)>>,
-    errors: AtomicU64,
-    denied: Mutex<Vec<PathBuf>>,
 }
 
-pub fn scan(roots: &[PathBuf], skip: &HashSet<PathBuf>, progress: &Progress) -> ScanResult {
-    let s = Scanner {
-        progress,
-        skip,
-        dirs: Mutex::default(),
-        large: Mutex::default(),
-        installers: Mutex::default(),
-        artifacts: Mutex::default(),
-        inodes: Mutex::default(),
-        errors: AtomicU64::new(0),
-        denied: Mutex::default(),
-    };
-
-    let roots: Vec<(PathBuf, u64)> = roots
-        .par_iter()
-        .filter_map(|root| {
-            let md = fs::metadata(root).ok()?;
-            // Stay on the root's filesystem, except when scanning "/" itself: on
-            // macOS the data volume is firmlinked into "/" with a different st_dev.
-            let dev = (root != Path::new("/")).then(|| md.dev());
-            let size = s.scan_dir(root, dev, false);
-            Some((root.clone(), size))
-        })
-        .collect();
-
-    let mut dirs: HashMap<PathBuf, u64> = s.dirs.into_inner().unwrap().into_iter().collect();
-    for (r, size) in &roots {
-        dirs.insert(r.clone(), *size);
+impl Shared {
+    pub fn bump(&self) {
+        self.version.fetch_add(1, Relaxed);
     }
-    ScanResult {
-        dirs,
-        roots,
-        large_files: s.large.into_inner().unwrap(),
-        installers: s.installers.into_inner().unwrap(),
-        artifacts: s.artifacts.into_inner().unwrap(),
-        errors: s.errors.into_inner(),
-        denied: s.denied.into_inner().unwrap(),
-    }
-}
 
-impl Scanner<'_> {
+    fn record_dir(&self, path: PathBuf, info: DirInfo) {
+        self.data.lock().unwrap().dirs.insert(path, info);
+        self.bump();
+    }
+
     fn error(&self, path: &Path, e: &io::Error) {
         if e.kind() == io::ErrorKind::NotFound {
             return; // vanished while scanning
         }
         self.errors.fetch_add(1, Relaxed);
         if e.kind() == io::ErrorKind::PermissionDenied {
-            let mut d = self.denied.lock().unwrap();
-            if d.len() < 200 {
-                d.push(path.to_path_buf());
+            let mut d = self.data.lock().unwrap();
+            if d.denied.len() < 200 {
+                d.denied.push(path.to_path_buf());
             }
         }
     }
 
-    /// Returns the on-disk size of everything below `dir`.
-    fn scan_dir(&self, dir: &Path, dev: Option<u64>, in_artifact: bool) -> u64 {
+    /// Forget `path` (deleted or moved away) and shrink its ancestors by `size`.
+    pub fn apply_removal(&self, path: &Path, size: u64) {
+        let mut d = self.data.lock().unwrap();
+        d.dirs.retain(|p, _| !p.starts_with(path));
+        d.artifacts.retain(|a| !a.path.starts_with(path));
+        d.large.retain(|f| !f.path.starts_with(path));
+        d.installers.retain(|f| !f.path.starts_with(path));
+        for anc in path.ancestors().skip(1) {
+            if let Some(i) = d.dirs.get_mut(anc) {
+                i.size = i.size.saturating_sub(size);
+            }
+        }
+        for (r, s) in d.roots.iter_mut() {
+            if path.starts_with(&*r) && path != r.as_path() {
+                *s = s.saturating_sub(size);
+            }
+        }
+        drop(d);
+        let _ = self.bytes.fetch_update(Relaxed, Relaxed, |b| Some(b.saturating_sub(size)));
+        self.bump();
+    }
+
+    /// Re-measure `path` after something outside changed it (e.g. `npm cache clean`).
+    pub fn refresh(&self, path: &Path) {
+        let old = {
+            let mut d = self.data.lock().unwrap();
+            let old = d.dirs.get(path).map_or(0, |i| i.size);
+            d.dirs.retain(|p, _| !p.starts_with(path));
+            old
+        };
+        let new = match fs::symlink_metadata(path) {
+            Ok(md) if md.is_dir() => {
+                let empty_skip = HashSet::new();
+                let empty_pre = HashMap::new();
+                let walk = Walk { sh: self, skip: &empty_skip, pre: &empty_pre, defer: None };
+                let info = walk.scan_dir(path, Some(md.dev()), false);
+                self.record_dir(path.to_path_buf(), info);
+                info.size
+            }
+            _ => 0,
+        };
+        // The walk added `new` to the byte counter; account for what disappeared.
+        let _ = self.bytes.fetch_update(Relaxed, Relaxed, |b| Some(b.saturating_sub(old)));
+        let mut d = self.data.lock().unwrap();
+        for anc in path.ancestors().skip(1) {
+            if let Some(i) = d.dirs.get_mut(anc) {
+                i.size = (i.size + new).saturating_sub(old);
+            }
+        }
+        for (r, s) in d.roots.iter_mut() {
+            if path.starts_with(&*r) && path != r.as_path() {
+                *s = (*s + new).saturating_sub(old);
+            }
+        }
+        drop(d);
+        self.bump();
+    }
+}
+
+/// The scan runs two walks at the same time:
+///  1. hotspots: the folders cleanup rules know about (caches, Docker, simulators,
+///     ...). They hold most reclaimable bytes, so their results show up within seconds.
+///  2. everything else under the roots (finding build artifacts, large files, ...).
+///     It skips the hotspots; their sizes are added to the parent folders at the end.
+pub fn run(sh: &Shared, roots: &[PathBuf], targets: Vec<PathBuf>, skip: &HashSet<PathBuf>) {
+    sh.phase.store(PHASE_HOTSPOTS, Relaxed);
+    let mut targets: Vec<PathBuf> = targets
+        .into_iter()
+        .filter(|t| fs::symlink_metadata(t).is_ok_and(|m| m.is_dir()))
+        .collect();
+    targets.sort();
+    targets.dedup();
+    let target_set: HashSet<PathBuf> = targets.iter().cloned().collect();
+
+    let (hot, roots_done) = rayon::join(
+        || {
+            let r = scan_hotspots(sh, &targets, skip);
+            sh.phase.store(PHASE_FULL, Relaxed);
+            r
+        },
+        || {
+            let walk = Walk { sh, skip, pre: &HashMap::new(), defer: Some(&target_set) };
+            roots
+                .par_iter()
+                .filter(|root| !target_set.contains(*root))
+                .filter_map(|root| {
+                    let md = fs::metadata(root).ok()?;
+                    // Stay on the root's filesystem, except when scanning "/" itself: on
+                    // macOS the data volume is firmlinked into "/" with a different st_dev.
+                    let dev = (root != Path::new("/")).then(|| md.dev());
+                    Some((root.clone(), walk.walk_dir(root, dev, true).0))
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+
+    // Merge: add each outermost hotspot's size to its ancestors and roots.
+    let mut d = sh.data.lock().unwrap();
+    for (root, info) in roots_done {
+        d.dirs.insert(root, info);
+    }
+    for (t, info) in &hot {
+        if t.ancestors().skip(1).any(|a| hot.contains_key(a)) {
+            continue; // already included in an outer hotspot
+        }
+        for anc in t.ancestors().skip(1) {
+            if let Some(i) = d.dirs.get_mut(anc) {
+                i.size += info.size;
+                i.mtime = i.mtime.max(info.mtime);
+            }
+            if roots.iter().any(|r| r == anc) {
+                break;
+            }
+        }
+    }
+    for root in roots {
+        if let Some(info) = d.dirs.get(root).copied().or_else(|| hot.get(root).copied()) {
+            d.dirs.insert(root.clone(), info);
+            d.roots.push((root.clone(), info.size));
+        }
+    }
+    drop(d);
+    sh.phase.store(PHASE_DONE, Relaxed);
+    sh.bump();
+}
+
+/// Scan the hotspot folders. Ones nested inside others (~/Library/Caches/Yarn inside
+/// ~/Library/Caches) go in an earlier wave, so the outer one reuses their result.
+fn scan_hotspots(sh: &Shared, targets: &[PathBuf], skip: &HashSet<PathBuf>) -> HashMap<PathBuf, DirInfo> {
+    let mut by_depth: Vec<&PathBuf> = targets.iter().collect();
+    by_depth.sort_by_key(|t| std::cmp::Reverse(t.components().count()));
+    let mut wave: HashMap<&PathBuf, usize> = HashMap::new();
+    for t in &by_depth {
+        let w = targets
+            .iter()
+            .filter(|o| o.starts_with(t) && o != t)
+            .filter_map(|o| wave.get(o))
+            .max()
+            .map_or(0, |w| w + 1);
+        wave.insert(t, w);
+    }
+    let max_wave = wave.values().copied().max().unwrap_or(0);
+
+    let mut pre: HashMap<PathBuf, DirInfo> = HashMap::new();
+    for w in 0..=max_wave {
+        let batch: Vec<&PathBuf> = targets.iter().filter(|t| wave[t] == w).collect();
+        let walk = Walk { sh, skip, pre: &pre, defer: None };
+        let done: Vec<(PathBuf, DirInfo)> = batch
+            .par_iter()
+            .filter_map(|t| {
+                let md = fs::symlink_metadata(t).ok()?;
+                let info = walk.scan_dir(t, Some(md.dev()), false);
+                sh.record_dir((*t).clone(), info);
+                Some(((*t).clone(), info))
+            })
+            .collect();
+        pre.extend(done);
+    }
+    pre
+}
+
+struct Walk<'a> {
+    sh: &'a Shared,
+    skip: &'a HashSet<PathBuf>,
+    /// Already measured subtrees, used instead of walking them again.
+    pre: &'a HashMap<PathBuf, DirInfo>,
+    /// Subtrees measured by the other (hotspot) walk; skipped here, merged later.
+    defer: Option<&'a HashSet<PathBuf>>,
+}
+
+impl Walk<'_> {
+    /// Size and newest mtime of everything below `dir`. With `detect`, also looks
+    /// for build artifacts, large files and installers.
+    fn scan_dir(&self, dir: &Path, dev: Option<u64>, detect: bool) -> DirInfo {
+        self.walk_dir(dir, dev, detect).0
+    }
+
+    /// Like `scan_dir`, plus whether a deferred hotspot lies somewhere below `dir`.
+    fn walk_dir(&self, dir: &Path, dev: Option<u64>, detect: bool) -> (DirInfo, bool) {
+        let sh = self.sh;
         let mut total = 0u64;
         let mut files = 0u64;
+        let mut newest = 0i64;
+        let mut manifest_mtime = 0i64;
         // Names of subdirectories and project marker files, for artifact detection.
         let mut markers: Vec<OsString> = Vec::new();
-        let mut subdirs: Vec<(PathBuf, i64)> = Vec::new();
+        let mut subdirs: Vec<PathBuf> = Vec::new();
 
-        let listed = list::list_dir(dir, |e| match e.kind {
-            list::Kind::Dir => {
-                if dev.is_some_and(|d| d != e.dev) {
-                    return; // another filesystem (mounted disk image, network share, ...)
-                }
-                let name = OsStr::from_bytes(e.name);
-                subdirs.push((dir.join(name), e.mtime));
-                markers.push(name.to_owned());
-            }
-            list::Kind::File => {
-                if e.nlink > 1 && !self.inodes.lock().unwrap().insert((e.dev, e.ino)) {
-                    return; // hard link we've already counted
-                }
-                total += e.size;
-                files += 1;
-                let name = OsStr::from_bytes(e.name);
-                if is_marker(name) {
+        let listed = list::list_dir(dir, |e| {
+            newest = newest.max(e.mtime);
+            match e.kind {
+                list::Kind::Dir => {
+                    if dev.is_some_and(|d| d != e.dev) {
+                        return; // another filesystem (mounted disk image, network share, ...)
+                    }
+                    let name = OsStr::from_bytes(e.name);
+                    subdirs.push(dir.join(name));
                     markers.push(name.to_owned());
                 }
-                if !in_artifact && e.size >= INSTALLER_MIN {
-                    let path = dir.join(name);
-                    let is_installer = path
-                        .extension()
-                        .and_then(|x| x.to_str())
-                        .is_some_and(|x| INSTALLER_EXTS.contains(&x.to_ascii_lowercase().as_str()));
-                    let hit = FileHit { path, size: e.size, mtime: e.mtime };
-                    if is_installer {
-                        self.installers.lock().unwrap().push(hit);
-                    } else if e.size >= LARGE_FILE_MIN {
-                        self.large.lock().unwrap().push(hit);
+                list::Kind::File => {
+                    if e.nlink > 1 && !sh.inodes.lock().unwrap().insert((e.dev, e.ino)) {
+                        return; // hard link we've already counted
+                    }
+                    total += e.size;
+                    files += 1;
+                    let name = OsStr::from_bytes(e.name);
+                    if is_marker(name) {
+                        markers.push(name.to_owned());
+                        manifest_mtime = manifest_mtime.max(e.mtime);
+                    }
+                    if detect && e.size >= INSTALLER_MIN {
+                        let path = dir.join(name);
+                        let is_installer = path
+                            .extension()
+                            .and_then(|x| x.to_str())
+                            .is_some_and(|x| INSTALLER_EXTS.contains(&x.to_ascii_lowercase().as_str()));
+                        let hit = FileHit { path, size: e.size, mtime: e.mtime };
+                        let mut d = sh.data.lock().unwrap();
+                        if is_installer {
+                            d.installers.push(hit);
+                        } else if e.size >= LARGE_FILE_MIN {
+                            d.large.push(hit);
+                        }
                     }
                 }
+                list::Kind::Other => {}
             }
-            list::Kind::Other => {}
         });
         if let Err(e) = listed {
-            self.error(dir, &e);
+            sh.error(dir, &e);
         }
-        self.progress.files.fetch_add(files, Relaxed);
-        self.progress.bytes.fetch_add(total, Relaxed);
+        sh.files.fetch_add(files, Relaxed);
+        sh.bytes.fetch_add(total, Relaxed);
 
         let markers = &markers;
-        let sub_total: u64 = subdirs
+        let sub: (u64, i64, bool) = subdirs
             .into_par_iter()
-            .map(|(path, mtime)| {
+            .map(|path| {
                 if !self.skip.is_empty() && self.skip.contains(&path) {
-                    return 0;
+                    return (0, 0, false);
                 }
-                let kind = if in_artifact { None } else { detect_artifact(&path, markers) };
-                let size = self.scan_dir(&path, dev, in_artifact || kind.is_some());
+                if let Some(info) = self.pre.get(&path) {
+                    return (info.size, info.mtime, false);
+                }
+                if self.defer.is_some_and(|d| d.contains(&path)) {
+                    return (0, 0, true);
+                }
+                let kind = if detect { detect_artifact(&path, markers) } else { None };
+                let (info, has_deferred) = self.walk_dir(&path, dev, detect && kind.is_none());
                 if let Some(kind) = kind {
-                    self.artifacts.lock().unwrap().push(Artifact { kind, path: path.clone(), size, mtime });
+                    sh.data.lock().unwrap().artifacts.push(Artifact {
+                        kind,
+                        path: path.clone(),
+                        size: info.size,
+                        mtime: info.mtime.max(manifest_mtime),
+                    });
+                    sh.bump();
                 }
-                if size >= DIR_RECORD_MIN {
-                    self.dirs.lock().unwrap().push((path, size));
+                // Folders holding a hotspot are kept regardless of size: the hotspot's
+                // size gets added to them when the walks are merged.
+                if info.size >= DIR_RECORD_MIN || has_deferred {
+                    sh.record_dir(path, info);
                 }
-                size
+                (info.size, info.mtime, has_deferred)
             })
-            .sum();
+            .reduce(|| (0, 0, false), |a, b| (a.0 + b.0, a.1.max(b.1), a.2 || b.2));
 
-        total + sub_total
+        (DirInfo { size: total + sub.0, mtime: newest.max(sub.1) }, sub.2)
     }
 }
 
