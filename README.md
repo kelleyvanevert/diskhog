@@ -6,6 +6,8 @@ Find out where your disk space went and win it back, biggest wins first.
 
 ![](./scr2.png)
 
+![](./scr3.png)
+
 ## Getting started
 
 ```bash
