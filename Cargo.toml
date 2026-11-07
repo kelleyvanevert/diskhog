@@ -1,0 +1,13 @@
+[package]
+name = "diskhog"
+version = "0.1.0"
+edition = "2024"
+description = "Find out where your disk space went and how to get it back"
+
+[dependencies]
+rayon = "1.10"
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = true
