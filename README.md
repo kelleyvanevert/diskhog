@@ -10,6 +10,11 @@ Find out where your disk space went and win it back, biggest wins first.
 
 ## Getting started
 
+Install with `cargo install --path .`. This builds a release binary into `~/.cargo/bin`,
+which rustup already put on your `PATH`, so `diskhog` works from anywhere. Run the same
+command again to update it. `rust-toolchain.toml` pins the Rust version; rustup fetches
+it on first build.
+
 ```bash
 cargo install --path .     # or: cargo build --release && ./target/release/diskhog
 diskhog                    # interactive full-screen UI
@@ -48,7 +53,7 @@ usage and counts hard links once.
 
 - **Categories** (left), largest first, tagged `SAFE` (rebuilt automatically) or
   `REVIEW` (your data or installs). **Items** (right) show size and age: last
-  modified, or for apps *last launched* (the access time of the app's executable).
+  modified, or for apps _last launched_ (the access time of the app's executable).
 - `o` selects everything unused for 3 months; press again for 6 months, 1 year, 2 years.
   `s` cycles the sort: size → most recently used first → least recently used first.
   `b` selects the item under the cursor and everything below it (and unselects
@@ -59,7 +64,7 @@ usage and counts hard links once.
   item. Rows show a spinner while being removed and `…` while queued. Pressing `d`
   again while busy adds to the queue.
 - `x` runs a category's proper cleanup command (`npm cache clean --force`, `brew
-  autoremove && brew cleanup`, …), then re-measures. Some categories offer a menu of
+autoremove && brew cleanup`, …), then re-measures. Some categories offer a menu of
   options from gentle to thorough (e.g. Docker: build cache unused 30+ days … all
   unused volumes).
 
@@ -69,16 +74,17 @@ Some space is one opaque blob on disk, but a tool knows what's inside it. For th
 diskhog asks the tool and lists the real items, with last-used dates, so `o`, `space`
 and `d` work just like they do for folders:
 
-| Category | Items | Removed with |
-|---|---|---|
+| Category                  | Items                                                    | Removed with                                                      |
+| ------------------------- | -------------------------------------------------------- | ----------------------------------------------------------------- |
 | Docker Desktop disk image | images, containers, volumes, build-cache entries ≥ 10 MB | `docker rm` / `rmi` / `volume rm` / `builder prune --filter id=…` |
-| iOS Simulator devices | each simulator (last booted) | `xcrun simctl delete <udid>` |
-| Simulator runtimes | each runtime (last used) | `xcrun simctl runtime delete <id>` |
+| iOS Simulator devices     | each simulator (last booted)                             | `xcrun simctl delete <udid>`                                      |
+| Simulator runtimes        | each runtime (last used)                                 | `xcrun simctl runtime delete <id>`                                |
 
 Running containers and simulators can't be selected. In a batch, containers are
 removed before the images they use, and the confirm dialog warns when Docker volumes
 (often database data) are included. Docker Desktop gives freed space back to macOS
 gradually, so the disk image can take a while to shrink.
+
 - `tab` switches to the **Explorer**, an ncdu-style folder browser that tags
   folders belonging to a cleanup category. `r` reveals the item in Finder. `?` shows help.
 
@@ -92,10 +98,10 @@ let it see Mail, Trash and other protected folders.
 
 ## Code
 
-| File | What |
-|---|---|
-| `src/scan.rs` | parallel walker, hotspot + full walks, live shared state |
-| `src/rules.rs` | the known space hogs, and grouping scan data into categories |
-| `src/tui.rs` | the ratatui interface |
-| `src/actions.rs` | Trash / delete jobs, app launch times |
-| `src/report.rs` | the non-interactive report |
+| File             | What                                                         |
+| ---------------- | ------------------------------------------------------------ |
+| `src/scan.rs`    | parallel walker, hotspot + full walks, live shared state     |
+| `src/rules.rs`   | the known space hogs, and grouping scan data into categories |
+| `src/tui.rs`     | the ratatui interface                                        |
+| `src/actions.rs` | Trash / delete jobs, app launch times                        |
+| `src/report.rs`  | the non-interactive report                                   |
