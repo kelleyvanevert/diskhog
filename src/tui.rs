@@ -181,10 +181,17 @@ impl App {
         if v != self.seen_version && (done || self.last_analyze.elapsed() > Duration::from_millis(400)) {
             self.seen_version = v;
             self.last_analyze = Instant::now();
-            self.cats = {
-                let d = self.sh.data.lock().unwrap();
-                rules::analyze(&d, &self.ctx)
-            };
+            let d = self.sh.data.lock().unwrap();
+            self.cats = rules::analyze(&d, &self.ctx);
+            // Keep selected sizes current after a refresh, so the totals adjust by the difference.
+            let sizes: HashMap<&Path, u64> =
+                self.cats.iter().flat_map(|c| c.items.iter().map(|i| (i.path.as_path(), i.size))).collect();
+            for (p, s) in self.selected.iter_mut() {
+                if let Some(&n) = sizes.get(p.as_path()).or(d.dirs.get(p).map(|i| &i.size)) {
+                    *s = n;
+                }
+            }
+            drop(d);
             self.path_cat = self
                 .cats
                 .iter()
@@ -429,7 +436,8 @@ impl App {
                     self.dialog = Some(Dialog::Remove { items, total });
                 }
             }
-            KeyCode::Char('r') => {
+            KeyCode::Char('r') => self.refresh_cursor(),
+            KeyCode::Char('f') => {
                 if let Some(p) = self.cursor_path().filter(|p| p.exists()) {
                     let _ = std::process::Command::new("open").arg("-R").arg(&p).spawn();
                     self.flash(format!("Revealed in Finder: {}", display_path(&p, &self.ctx.home)));
@@ -441,6 +449,39 @@ impl App {
             },
         }
         Ok(())
+    }
+
+    /// Re-measure what's under the cursor: an item, a folder, or (on a category) the whole category.
+    fn refresh_cursor(&mut self) {
+        let (provider, paths, what) = match (self.view, self.focus) {
+            (View::Categories, Focus::Cats) => match self.cur_cat() {
+                Some(c) => (c.provider, c.items.iter().map(|i| i.path.clone()).collect(), c.title.clone()),
+                None => return,
+            },
+            (View::Categories, Focus::Items) => {
+                let cat = self.cur_cat().and_then(|c| c.provider);
+                match self.cursor_path() {
+                    Some(p) => (cat, vec![p.clone()], display_path(&p, &self.ctx.home)),
+                    None => return,
+                }
+            }
+            (View::Explorer, _) => match self.cursor_path() {
+                Some(p) => (None, vec![p.clone()], display_path(&p, &self.ctx.home)),
+                None => return,
+            },
+        };
+        if let Some(pr) = provider {
+            // Docker/simctl items aren't files: ask the tool again instead.
+            crate::providers::refresh(&self.sh, pr);
+        } else {
+            let sh = self.sh.clone();
+            std::thread::spawn(move || {
+                for p in paths.iter().filter(|p| p.is_absolute()) {
+                    sh.refresh(p);
+                }
+            });
+        }
+        self.flash(format!("Re-measuring {what}…"));
     }
 
     fn cursor_path(&self) -> Option<PathBuf> {
@@ -1140,11 +1181,11 @@ impl App {
                 key("↑↓"), desc("move"), key("←→"), desc("pane"), key("space"), desc("select"),
                 key("o"), desc(&format!("unused {next_age}+")), key("a"), desc("all"), key("n"), desc("none"),
                 key("b"), desc("this & below"), key("s"), desc("sort"), key("d"), desc("remove"), key("x"), desc("command"),
-                key("r"), desc("reveal"), key("tab"), desc("explorer"), key("?"), desc("help"), key("q"), desc("quit"),
+                key("r"), desc("refresh"), key("f"), desc("finder"), key("tab"), desc("explorer"), key("?"), desc("help"), key("q"), desc("quit"),
             ],
             View::Explorer => vec![
                 key("↑↓"), desc("move"), key("→/enter"), desc("open"), key("←"), desc("up"), key("space"), desc("select"),
-                key("d"), desc("remove"), key("r"), desc("reveal"), key("tab"), desc("categories"), key("?"), desc("help"),
+                key("d"), desc("remove"), key("r"), desc("refresh"), key("f"), desc("finder"), key("tab"), desc("categories"), key("?"), desc("help"),
                 key("q"), desc("quit"),
             ],
         };
@@ -1299,7 +1340,8 @@ fn help_text() -> Text<'static> {
         Line::raw(""),
         Line::styled("  Everywhere", Style::new().bold().underlined()),
         row("d", "remove the selection (or the item under the cursor): Trash or delete"),
-        row("r", "reveal in Finder"),
+        row("r", "refresh: re-measure the item, folder or category under the cursor"),
+        row("f", "reveal in Finder"),
         row("tab / 1 / 2", "switch between categories and the folder explorer"),
         row("q / Ctrl-C", "quit"),
         Line::raw(""),

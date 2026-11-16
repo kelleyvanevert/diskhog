@@ -144,7 +144,12 @@ pub const RULES: &[Rule] = &[
     r("Gradle caches", Safe, "Re-downloaded on next build", &["~/.gradle/caches", "~/.gradle/wrapper/dists", "~/.gradle/daemon"]).expand(),
     r("Maven repository", Safe, "Re-downloaded on next build", &["~/.m2/repository"]),
     r("Python package caches", Safe, "Re-downloaded when needed",
-      &["~/Library/Caches/pip", "~/.cache/pip", "~/.cache/uv", "~/Library/Caches/pypoetry", "~/.cache/pypoetry"]),
+      &["~/Library/Caches/pip", "~/.cache/pip", "~/.cache/uv", "~/Library/Caches/pypoetry", "~/.cache/pypoetry"])
+        .options(&[
+          ("pip: empty the whole cache", "pip cache purge"),
+          ("uv: remove only entries nothing uses anymore", "uv cache prune"),
+          ("uv: empty the whole cache", "uv cache clean"),
+        ]),
     r("Conda package cache", Safe, "Cached package tarballs",
       &["~/miniconda3/pkgs", "~/anaconda3/pkgs", "~/miniforge3/pkgs", "~/mambaforge/pkgs", "~/opt/anaconda3/pkgs",
         "~/opt/miniconda3/pkgs", "/opt/homebrew/Caskroom/miniconda/base/pkgs", "/opt/homebrew/Caskroom/miniforge/base/pkgs"])

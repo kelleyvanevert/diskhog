@@ -86,7 +86,7 @@ removed before the images they use, and the confirm dialog warns when Docker vol
 gradually, so the disk image can take a while to shrink.
 
 - `tab` switches to the **Explorer**, an ncdu-style folder browser that tags
-  folders belonging to a cleanup category. `r` reveals the item in Finder. `?` shows help.
+  folders belonging to a cleanup category. `r` re-measures the item under the cursor, `f` reveals it in Finder. `?` shows help.
 
 Items that shouldn't be deleted file-by-file (iCloud Drive, Photos, Docker's disk
 image, Homebrew's Cellar, Simulator devices, Ollama blobs, …) are dimmed. Use the
